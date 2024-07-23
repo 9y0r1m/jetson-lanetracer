@@ -8,7 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
 )
 
-find_package(OpenCV REQUIRED)
+find_package(OpenCV 4 REQUIRED)
 find_package(dynamixel_sdk REQUIRED)
 
 catkin_package(
