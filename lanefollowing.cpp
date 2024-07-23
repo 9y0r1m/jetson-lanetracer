@@ -1,189 +1,72 @@
-#include <ros/ros.h>
-#include <opencv2/opencv.hpp>
-#include "dynamixel_sdk.h"
-#include <termios.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <vector>
-#include <algorithm>
+import cv2
+import numpy as np
+from jetracer.nvidia_racecar import NvidiaRacecar
 
-using namespace std;
-using namespace cv;
+# Initialize JetRacer
+car = NvidiaRacecar()
+car.throttle_gain = 0.5
+car.steering_gain = 0.5
 
-// Control table address
-#define ADDR_MX_TORQUE_ENABLE           24
-#define ADDR_MX_GOAL_POSITION           30
-#define ADDR_MX_PRESENT_POSITION        36
-#define ADDR_MX_MOVING_SPEED            32
+# Initialize USB webcam
+cap = cv2.VideoCapture(0)  # If the USB webcam is not detected, you might need to change the index to 1 or higher
 
-// Data Byte Length
-#define LEN_MX_GOAL_POSITION            2
-#define LEN_MX_PRESENT_POSITION         2
-#define LEN_MX_MOVING_SPEED             2
+if not cap.isOpened():
+    print("Cannot open camera")
+    exit()
 
-// Protocol version
-#define PROTOCOL_VERSION                1.0
+prev_center_x = 320
 
-// Default setting
-#define DXL1_ID                         1
-#define DXL2_ID                         2
-#define BAUDRATE                        2000000
-#define DEVICENAME                      "/dev/ttyUSB0"
+while True:
+    ret, frame = cap.read()
 
-#define TORQUE_ENABLE                   1
-#define TORQUE_DISABLE                  0
-#define DXL_MINIMUM_POSITION_VALUE      300
-#define DXL_MAXIMUM_POSITION_VALUE      600
-#define DXL_MOVING_STATUS_THRESHOLD     10
+    if not ret:
+        print("Cannot receive frame")
+        break
 
-#define ESC_ASCII_VALUE                 0x1b
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-extern "C" {
-    unsigned int vel_convert(int speed);
-    int syncwrite(int port_num, int group_num, int goal_velocity1, int goal_velocity2);
-}
+    # Thresholding
+    _, binary = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY_INV)
 
-int getch()
-{
-    struct termios oldt, newt;
-    int ch;
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    ch = getchar();
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    return ch;
-}
+    # Region of interest
+    roi = binary[binary.shape[0]//2:, :]
 
-int kbhit(void)
-{
-    struct termios oldt, newt;
-    int ch;
-    int oldf;
+    # Find contours
+    contours, _ = cv2.findContours(roi, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+    # Find the largest contour
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            center_x = int(M["m10"] / M["m00"])
+        else:
+            center_x = prev_center_x
 
-    ch = getchar();
+        error = center_x - 320  # Calculate the difference from the image center
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    fcntl(STDIN_FILENO, F_SETFL, oldf);
+        # Simple PID control
+        kP = 0.01
+        steering = kP * error
 
-    if (ch != EOF)
-    {
-        ungetc(ch, stdin);
-        return 1;
-    }
+        # Set motor speed and direction based on steering
+        car.steering = np.clip(steering, -1, 1)
+        car.throttle = 0.3
 
-    return 0;
-}
+        prev_center_x = center_x
 
-string codec1 = "nvarguscamerasrc sensor-id=0 ! video/x-raw(memory:NVMM), width=(int)640, height=(int)360, format=(string)NV12, framerate=(fraction)15/1 ! \
-     nvvidconv flip-method=0 ! video/x-raw, width=(int)640, height=(int)360, format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink";
+        # Debug output
+        print(f"Center: {center_x}, Error: {error}, Steering: {steering}")
 
-int main(int argc, char** argv)
-{
-    ros::init(argc, argv, "lanefollowing_node");
-    ros::NodeHandle nh;
+        # Visualize contours and center point
+        cv2.drawContours(frame, [largest_contour + np.array([0, frame.shape[0]//2])], -1, (0, 255, 0), 2)
+        cv2.circle(frame, (center_x, frame.shape[0]//2 + roi.shape[0]//2), 5, (0, 0, 255), -1)
 
-    // Video capture
-    VideoCapture cap1(codec1, CAP_GSTREAMER);
-    if (!cap1.isOpened()) {
-        ROS_ERROR("Failed to open video stream");
-        return -1;
-    }
+    cv2.imshow('Frame', frame)
 
-    // Initialize PortHandler Structs
-    int port_num = portHandler(DEVICENAME);
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-    // Initialize PacketHandler Structs
-    packetHandler();
-
-    // Initialize Groupsyncwrite instance
-    int group_num = groupSyncWrite(port_num, PROTOCOL_VERSION, ADDR_MX_MOVING_SPEED, LEN_MX_GOAL_POSITION);
-
-    int dxl_comm_result = COMM_TX_FAIL;
-    uint8_t dxl_addparam_result = false;
-    int dxl_goal_position[2] = { DXL_MINIMUM_POSITION_VALUE, DXL_MAXIMUM_POSITION_VALUE };
-    uint8_t dxl_error = 0;
-    uint16_t dxl1_present_position = 0, dxl2_present_position = 0;
-
-    // Open port
-    if (openPort(port_num)) {
-        ROS_INFO("Succeeded to open the port!");
-    } else {
-        ROS_ERROR("Failed to open the port!");
-        return 0;
-    }
-
-    // Set port baudrate
-    if (setBaudRate(port_num, BAUDRATE)) {
-        ROS_INFO("Succeeded to change the baudrate!");
-    } else {
-        ROS_ERROR("Failed to change the baudrate!");
-        return 0;
-    }
-
-    // Enable Dynamixel#1 Torque
-    write1ByteTxRx(port_num, PROTOCOL_VERSION, DXL1_ID, ADDR_MX_TORQUE_ENABLE, TORQUE_ENABLE);
-    if ((dxl_comm_result = getLastTxRxResult(port_num, PROTOCOL_VERSION)) != COMM_SUCCESS) {
-        ROS_ERROR("%s", getTxRxResult(PROTOCOL_VERSION, dxl_comm_result));
-    } else if ((dxl_error = getLastRxPacketError(port_num, PROTOCOL_VERSION)) != 0) {
-        ROS_ERROR("%s", getRxPacketError(PROTOCOL_VERSION, dxl_error));
-    } else {
-        ROS_INFO("Dynamixel#%d has been successfully connected", DXL1_ID);
-    }
-
-    // Enable Dynamixel#2 Torque
-    write1ByteTxRx(port_num, PROTOCOL_VERSION, DXL2_ID, ADDR_MX_TORQUE_ENABLE, TORQUE_ENABLE);
-    if ((dxl_comm_result = getLastTxRxResult(port_num, PROTOCOL_VERSION)) != COMM_SUCCESS) {
-        ROS_ERROR("%s", getTxRxResult(PROTOCOL_VERSION, dxl_comm_result));
-    } else if ((dxl_error = getLastRxPacketError(port_num, PROTOCOL_VERSION)) != 0) {
-        ROS_ERROR("%s", getRxPacketError(PROTOCOL_VERSION, dxl_error));
-    } else {
-        ROS_INFO("Dynamixel#%d has been successfully connected", DXL2_ID);
-    }
-
-    Mat frame1, gray, dst;
-    Point2d prevpt1(110, 60);
-    Point2d prevpt2(520, 60);
-    Point2d cpt[2];
-    Point2d fpt;
-    int minlb[2];
-    int thres;
-    double ptdistance[2];
-    double threshdistance[2];
-    vector<double> mindistance1;
-    vector<double> mindistance2;
-    double error;
-    double myproms;
-    int count = 0;
-
-    while (ros::ok())
-    {
-        int64 t1 = getTickCount();
-
-        cap1 >> frame1;
-
-        cvtColor(frame1, gray, COLOR_BGR2GRAY);
-        gray = gray + 100 - mean(gray)[0];
-        thres = 160;
-        threshold(gray, gray, thres, 255, THRESH_BINARY);
-
-        dst = gray(Rect(0, gray.rows / 3 * 2, gray.cols, gray.rows / 3));
-
-        Mat labels, stats, centroids;
-        int cnt = connectedComponentsWithStats(dst, labels, stats, centroids);
-        if (cnt > 1) {
-            for (int i = 1; i < cnt; i++) {
-                double* p = centroids.ptr<double>(i);
-                ptdistance[0] = abs(p[0] - prevpt1.x);
-                ptdistance[1] = abs(p[0] - prevpt2.x);
-                mindistance1.push_back(ptdistance[0]);
-                mindistance2.push_back(ptdistance[1]);
-           
+cap.release()
+cv2.destroyAllWindows()
