@@ -65,14 +65,14 @@ int kbhit(void)
     tcgetattr(STDIN_FILENO, &oldt);
     newt = oldt;
     newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILINO, TCSANOW, &newt);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
     oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
 
     ch = getchar();
 
-    tcsetattr(STDIN_FILINO, TCSANOW, &oldt);
-    fcntl(STDIN_FILINO, F_SETFL, oldf);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    fcntl(STDIN_FILENO, F_SETFL, oldf);
 
     if (ch != EOF)
     {
@@ -183,4 +183,7 @@ int main(int argc, char** argv)
             for (int i = 1; i < cnt; i++) {
                 double* p = centroids.ptr<double>(i);
                 ptdistance[0] = abs(p[0] - prevpt1.x);
-                p
+                ptdistance[1] = abs(p[0] - prevpt2.x);
+                mindistance1.push_back(ptdistance[0]);
+                mindistance2.push_back(ptdistance[1]);
+           
